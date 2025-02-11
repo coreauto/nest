@@ -1,0 +1,58 @@
+image: maven:3-amazoncorretto-21
+
+clone:
+  depth: full
+
+definitions:
+  caches:
+    sonar: ~/.sonar/cache
+  services:
+    docker:
+      memory: 4098
+
+  steps:
+    - step: &build-commonsvc-branch
+        name: Testing Build & Checking Sonar for Branch
+        size: 2x
+        caches:
+          - maven
+          - sonar
+        script:
+          - yum update -y && yum install -y git openssh-clients
+          - git clone -b $BITBUCKET_BRANCH git@bitbucket.org:bktdefault/common-svc.git /tmp/common-svc
+          - cd /tmp/common-svc
+          - git status
+          - mvn clean install
+          - mkdir $BITBUCKET_CLONE_DIR/src/libs/
+          - cp -r target/*.jar $BITBUCKET_CLONE_DIR/src/libs/
+          - cd $BITBUCKET_CLONE_DIR
+          - mvn clean package
+          - mvn sonar:sonar -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.organization=$SONAR_ORGANIZATION -Dsonar.host.url=$SONAR_HOST -Dsonar.token=$SONAR_TOKEN -Dsonar.branch.name=$BITBUCKET_BRANCH -Dsonar.scm.disabled=true -Dsonar.qualitygate.wait=true
+
+    - step: &build-commonsvc-pr
+        name: Testing Build & Checking Sonar for PR
+        size: 2x
+        caches:
+          - maven
+          - sonar
+        script:
+          - yum update -y && yum install -y git openssh-clients
+          - git clone -b $BITBUCKET_PR_DESTINATION_BRANCH git@bitbucket.org:bktdefault/common-svc.git /tmp/common-svc
+          - cd /tmp/common-svc
+          - git status
+          - mvn clean install
+          - mkdir $BITBUCKET_CLONE_DIR/src/libs/
+          - cp -r target/*.jar $BITBUCKET_CLONE_DIR/src/libs/
+          - cd $BITBUCKET_CLONE_DIR
+          - mvn clean package
+          - mvn sonar:sonar -Dsonar.pullrequest.key=$BITBUCKET_PR_ID -Dsonar.pullrequest.branch=$BITBUCKET_BRANCH -Dsonar.pullrequest.base=$BITBUCKET_PR_DESTINATION_BRANCH -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.organization=$SONAR_ORGANIZATION -Dsonar.host.url=$SONAR_HOST -Dsonar.token=$SONAR_TOKEN -Dsonar.scm.disabled=true -Dsonar.qualitygate.wait=true
+
+
+pipelines:
+  branches:
+    "{sandbox,develop,staging,main,feature/sprint*,release,phase-2-*}":
+      - step: *build-commonsvc-branch
+
+  pull-requests:
+    '**':
+      - step: *build-commonsvc-pr

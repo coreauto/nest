@@ -1,0 +1,115 @@
+version: 0.2
+
+env:
+  secrets-manager:
+    BITBUCKET_USERNAME: dev/secrets:BITBUCKET_USERNAME
+    BITBUCKET_APP_PASSWORD: dev/secrets:BITBUCKET_APP_PASSWORD
+
+  # Note: Environment variables such as TARGET_AWS_ACCOUNT_ID, ECR_REPOSITORY, ECS_CLUSTER_NAME, 
+  # ECS_CONTAINER_NAME, ECS_SERVICE_NAME, AWS_DEFAULT_REGION, S3_BUCKET_NAME, S3_KEY, GIT_BRANCH, 
+  # and S3_PIPELINE_PATH are passed in the build stage configuration.
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto21
+    commands:
+      - echo Updating package lists...
+      # Fix for GitHub CLI GPG key issue
+      - curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg
+      - apt-get update -y
+      - echo Installing dependencies...
+      - apt-get install -y git jq
+
+  pre_build:
+    commands:
+      # Clone the common-svc repository from Bitbucket:
+      # This step is necessary because the grading-svc (main service being built) depends on
+      # components provided by the common-svc. By cloning the common-svc repository, we 
+      # ensure that the necessary shared libraries or modules are available during the build process.
+      - echo Setting up AWS CLI with assumed role...
+      - ROLE_SESSION_NAME=codebuild-session
+      - ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn $ASSUMED_ROLE_NAME --role-session-name $ROLE_SESSION_NAME)
+      - export AWS_ACCESS_KEY_ID=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.AccessKeyId')
+      - export AWS_SECRET_ACCESS_KEY=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SecretAccessKey')
+      - export AWS_SESSION_TOKEN=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SessionToken')
+      - echo Cloning the common-svc repository...      
+      - git clone --branch $GIT_BRANCH https://$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD@bitbucket.org/bktdefault/common-svc.git /tmp/common-svc
+      - cd /tmp/common-svc
+      - echo Running Maven build for common-svc...
+      - mvn clean install
+      - echo Copying JAR to primary repo libs directory...
+      - mkdir -p $CODEBUILD_SRC_DIR/libs
+      - cp target/*.jar $CODEBUILD_SRC_DIR/libs/
+      - cd $CODEBUILD_SRC_DIR
+      - echo Running Maven build for grading-svc...
+      - mvn clean package #install # Includes unit tests, dependency-checks, JaCoCo report, and Checkstyle analysis
+
+      # Initiate Sonarcloud scanning
+      - mvn sonar:sonar -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.organization=$SONAR_ORGANIZATION -Dsonar.host.url=$SONAR_HOST -Dsonar.login=$SONAR_TOKEN -Dsonar.branch.name=$BITBUCKET_BRANCH -Dsonar.scm.disabled=true
+
+      # Check SonarQube Quality Gate
+      #- echo Checking SonarQube Quality Gate...
+      #- |
+      #  STATUS=$(curl -s -u $SONAR_TOKEN: "$SONAR_HOST/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" | jq -r '.projectStatus.status')
+      #  echo "Quality Gate Status: $STATUS"
+      #  if [ "$STATUS" != "OK" ]; then
+      #    echo "Quality Gate failed. Exiting."
+      #    exit 1
+      #  fi
+
+
+      # Log in to Amazon ECR:
+      # Authenticate with Amazon ECR to prepare for pushing the Docker image later.
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $TARGET_AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH}-$CODEBUILD_BUILD_NUMBER
+      - echo $COMMIT_HASH
+      - REPOSITORY_URI=$TARGET_AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
+      - echo REPOSITORY_URI=$REPOSITORY_URI
+      - echo IMAGE_TAG=$IMAGE_TAG
+      - echo CONTAINER_NAME=$ECS_CONTAINER_NAME
+
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building the Docker image...
+      - docker build --build-arg AWS_SECRETS_PATH=$AWS_SECRETS_PATH -t $REPOSITORY_URI:$IMAGE_TAG -f Dockerfile.sbx .
+      - echo Tagging the Docker image as latest...
+      - docker tag $REPOSITORY_URI:$IMAGE_TAG $REPOSITORY_URI:latest
+
+  post_build:
+    commands:
+      # Build the Docker image:
+      # This step creates a Docker image for the grading-svc, incorporating the necessary dependencies
+      # and configurations.  
+      - echo Build completed on `date`
+      - echo Pushing the Docker image with tag $IMAGE_TAG to ECR...
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      
+      # Generate imagedefinitions.json:
+      # This file is used by CodePipeline during the deployment phase to update the ECS service
+      # with the new Docker image.
+      - echo Writing image definitions file...
+      - printf '[{"name":"%s","imageUri":"%s"}]' $ECS_CONTAINER_NAME $REPOSITORY_URI:$IMAGE_TAG > imagedefinitions.json
+      - cat imagedefinitions.json  # For debugging, optional
+    
+      # Upload imagedefinitions.json to S3:
+      # The imagedefinitions.json file is uploaded to S3, where it can be accessed by the deployment stage.
+      - echo Uploading imagedefinitions.json to S3...
+      - aws s3 cp imagedefinitions.json s3://$S3_BUCKET_NAME/$S3_PIPELINE_PATH/imagedefinitions.json
+ 
+      # Restart the ECS service:
+      # Force a new deployment in ECS to pull the latest Docker image and update the running service.     
+      - echo Restarting ECS service to pull the latest image...
+      - aws ecs update-service --region $AWS_DEFAULT_REGION --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --force-new-deployment
+
+artifacts:
+  files:
+    - imagedefinitions.json
+    
+cache:
+  paths:
+    - '/root/.m2/**/*'
+

@@ -1,0 +1,102 @@
+version: 0.2
+ 
+env:
+  secrets-manager:
+    BITBUCKET_USERNAME: dev/secrets:BITBUCKET_USERNAME
+    BITBUCKET_APP_PASSWORD: dev/secrets:BITBUCKET_APP_PASSWORD
+ 
+  variables:
+    DEVELOP_ACCOUNT_ID: 975050053689
+    QA_ACCOUNT_ID: 637423185434
+    AWS_DEFAULT_REGION: us-east-1  
+    ECR_REPOSITORY: "cornerstone-grading-svc-ecr-repo"
+    ECS_CONTAINER_NAME: "commons-grading-svc-8080-tcp"
+    ECS_SERVICE_NAME: "commons-grading-svc"
+    S3_BUCKET_NAME: "beckett-sast-report" 
+    S3_PIPELINE_PATH: "grading-svc"
+ 
+phases:
+  pre_build:
+    commands:
+      - echo "Setting up AWS CLI with assumed role for ECR access..."
+      - ROLE_SESSION_NAME=codebuild-session
+      # Set REPOSITORY_URI based on the branch
+      - |
+        if [ "$GIT_BRANCH" = "develop" ]; then
+          REPOSITORY_URI=$DEVELOP_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
+        else
+          REPOSITORY_URI=$QA_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$ECR_REPOSITORY
+        fi
+        
+      - echo "REPOSITORY_URI set to $REPOSITORY_URI"
+      - ASSUME_ROLE_OUTPUT=$(aws sts assume-role --role-arn arn:aws:iam::$TARGET_AWS_ACCOUNT_ID:role/$ASSUMED_ROLE_NAME --role-session-name $ROLE_SESSION_NAME)
+      - export AWS_ACCESS_KEY_ID=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.AccessKeyId')
+      - export AWS_SECRET_ACCESS_KEY=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SecretAccessKey')
+      - export AWS_SESSION_TOKEN=$(echo $ASSUME_ROLE_OUTPUT | jq -r '.Credentials.SessionToken')
+      - echo Cloning the common-svc repository...
+      - git clone --branch $GIT_BRANCH https://$BITBUCKET_USERNAME:$BITBUCKET_APP_PASSWORD@bitbucket.org/bktdefault/common-svc.git /tmp/common-svc
+      - cd /tmp/common-svc
+      - echo Running Maven build for common-svc...
+      - mvn clean install
+      - echo Copying JAR to primary repo libs directory...
+      - mkdir -p $CODEBUILD_SRC_DIR/libs
+      - cp target/*.jar $CODEBUILD_SRC_DIR/libs/
+      - cd $CODEBUILD_SRC_DIR
+      - echo Running Maven build for grading-svc...
+      - mvn clean package
+
+      # Log in to Amazon ECR:
+      - echo "Logging in to Amazon ECR in repository account..."
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
+
+  build:
+    commands:
+      - echo "Build started on $(date)"
+      - echo "Building Docker image with 'latest' tag using golden image as base..."
+      - docker build --build-arg AWS_SECRETS_PATH=$AWS_SECRETS_PATH -t $REPOSITORY_URI:latest .
+ 
+  post_build:
+    commands:
+      - echo "Build completed on $(date)"
+      - echo "Pushing Docker image with 'latest' tag to ECR..."
+      - docker push $REPOSITORY_URI:latest
+ 
+      - echo "Generating imagedefinitions.json for deployment..."
+      - printf '[{"name":"%s","imageUri":"%s"}]' $ECS_CONTAINER_NAME $REPOSITORY_URI:latest > imagedefinitions.json
+      - cat imagedefinitions.json
+ 
+      - echo "Uploading imagedefinitions.json to S3..."
+      - aws s3 cp imagedefinitions.json s3://$S3_BUCKET_NAME/$S3_PIPELINE_PATH/imagedefinitions.json
+ 
+      - echo "Forcing ECS service deployment to pull the latest image..."
+      - aws ecs update-service --region $AWS_DEFAULT_REGION --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --force-new-deployment
+      # Poll ECS Service for deployment status
+      - echo "Checking ECS deployment status..."
+      - |
+        for attempt in {1..30}; do
+          DEPLOYMENT_STATUS=$(aws ecs describe-services --cluster $ECS_CLUSTER_NAME --services $ECS_SERVICE_NAME --query "services[0].deployments[?status=='PRIMARY'].rolloutState" --output text)
+          if [ "$DEPLOYMENT_STATUS" == "COMPLETED" ]; then
+            echo "Deployment succeeded."
+            break
+          elif [ "$DEPLOYMENT_STATUS" == "FAILED" ]; then
+            echo "Deployment failed. Exiting."
+            exit 1
+          else
+            echo "Deployment in progress... (attempt $attempt)"
+            sleep 10
+          fi
+ 
+          if [ $attempt -eq 30 ]; then
+            echo "Deployment timed out. Exiting."
+            exit 1
+          fi
+        done
+ 
+artifacts:
+  files:
+    - imagedefinitions.json
+ 
+cache:
+  paths:
+    - '/root/.m2/**/*'
+    
